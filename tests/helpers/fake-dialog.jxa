@@ -1,0 +1,36 @@
+ObjC.import('Foundation');
+
+function append(path, text) {
+    const manager = $.NSFileManager.defaultManager;
+    if (!manager.fileExistsAtPath(path)) {
+        $.NSData.data.writeToFileAtomically(path, true);
+    }
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath(path);
+    handle.seekToEndOfFile;
+    handle.writeData($.NSString.stringWithString(text).dataUsingEncoding($.NSUTF8StringEncoding));
+    handle.closeFile;
+}
+
+function write(path, text) {
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath(path);
+    handle.truncateFileAtOffset(0);
+    handle.writeData($.NSString.stringWithString(text).dataUsingEncoding($.NSUTF8StringEncoding));
+    handle.closeFile;
+}
+
+function run(argv) {
+    const env = $.NSProcessInfo.processInfo.environment;
+    const log = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_LOG') || '');
+    const captureDir = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_CAPTURE_DIR') || '');
+    const decision = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION') || 'sign');
+    const delay = Number(ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DELAY') || '0'));
+    if (log) append(log, 'start ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
+    if (captureDir) {
+        const pid = String($.NSProcessInfo.processInfo.processIdentifier);
+        $.NSData.dataWithContentsOfFile(argv[0]).writeToFileAtomically(captureDir + '/' + pid + '.summary', true);
+        $.NSData.dataWithContentsOfFile(argv[1]).writeToFileAtomically(captureDir + '/' + pid + '.details', true);
+    }
+    if (delay > 0) $.NSThread.sleepForTimeInterval(delay);
+    write(argv[2], decision);
+    if (log) append(log, 'end ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
+}

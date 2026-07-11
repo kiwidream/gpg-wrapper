@@ -1,0 +1,111 @@
+ObjC.import('Cocoa');
+
+function unwrap(value) {
+    return ObjC.unwrap(value);
+}
+
+function readText(path) {
+    const data = $.NSData.dataWithContentsOfFile(path);
+    if (!data) {
+        throw new Error('Unable to read review data.');
+    }
+    let text = $.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding);
+    if (!text) {
+        text = $.NSString.alloc.initWithDataEncoding(data, $.NSISOLatin1StringEncoding);
+    }
+    if (!text) {
+        throw new Error('Unable to decode review data.');
+    }
+    return unwrap(text);
+}
+
+function writeDecision(path, decision) {
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath(path);
+    if (!handle) {
+        throw new Error('Unable to open the decision file.');
+    }
+    handle.truncateFileAtOffset(0);
+    const data = $.NSString.stringWithString(decision).dataUsingEncoding($.NSUTF8StringEncoding);
+    handle.writeData(data);
+    handle.synchronizeFile;
+    handle.closeFile;
+}
+
+function scrollableText(text, width, height) {
+    const frame = $.NSMakeRect(0, 0, width, height);
+    const scroll = $.NSScrollView.alloc.initWithFrame(frame);
+    scroll.hasVerticalScroller = true;
+    scroll.hasHorizontalScroller = true;
+    scroll.autohidesScrollers = true;
+    scroll.borderType = $.NSBezelBorder;
+
+    const contentSize = scroll.contentSize;
+    const textView = $.NSTextView.alloc.initWithFrame($.NSMakeRect(0, 0, contentSize.width, contentSize.height));
+    textView.minSize = $.NSMakeSize(0, contentSize.height);
+    textView.maxSize = $.NSMakeSize(10000000, 10000000);
+    textView.verticallyResizable = true;
+    textView.horizontallyResizable = true;
+    textView.autoresizingMask = $.NSViewWidthSizable;
+    textView.textContainer.containerSize = $.NSMakeSize(10000000, 10000000);
+    textView.textContainer.widthTracksTextView = false;
+    textView.editable = false;
+    textView.selectable = true;
+    textView.richText = false;
+    textView.font = $.NSFont.monospacedSystemFontOfSizeWeight(12, $.NSFontWeightRegular);
+    textView.string = text;
+    scroll.documentView = textView;
+    return scroll;
+}
+
+function run(argv) {
+    if (argv.length !== 3) {
+        throw new Error('Expected summary, details, and decision paths.');
+    }
+    const summary = readText(argv[0]);
+    const details = readText(argv[1]);
+    const decisionPath = argv[2];
+
+    const app = $.NSApplication.sharedApplication;
+    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    app.activateIgnoringOtherApps(true);
+
+    while (true) {
+        const alert = $.NSAlert.alloc.init;
+        alert.alertStyle = $.NSAlertStyleWarning;
+        alert.messageText = 'Git OpenPGP Signing Preview';
+        alert.informativeText = 'Review the request below. GPG receives only the exact payload identified by byte count and SHA-256; commit diffs are derived review aids.';
+        alert.accessoryView = scrollableText(summary, 780, 430);
+        alert.addButtonWithTitle('Sign');
+        alert.addButtonWithTitle('Cancel');
+        alert.addButtonWithTitle('View Details');
+        const response = Number(alert.runModal);
+        if (response === Number($.NSAlertFirstButtonReturn)) {
+            writeDecision(decisionPath, 'sign');
+            return;
+        }
+        if (response === Number($.NSAlertSecondButtonReturn)) {
+            writeDecision(decisionPath, 'cancel');
+            return;
+        }
+
+        const detailAlert = $.NSAlert.alloc.init;
+        detailAlert.alertStyle = $.NSAlertStyleInformational;
+        detailAlert.messageText = 'Exact Payload and Derived Review Report';
+        detailAlert.informativeText = 'The exact GPG input is explicitly marked. The full diff is derived from Git objects and is not literal signed input.';
+        detailAlert.accessoryView = scrollableText(details, 920, 600);
+        detailAlert.addButtonWithTitle('Back');
+        detailAlert.addButtonWithTitle('Sign');
+        detailAlert.addButtonWithTitle('Cancel');
+        app.activateIgnoringOtherApps(true);
+        const detailResponse = Number(detailAlert.runModal);
+        if (detailResponse === Number($.NSAlertSecondButtonReturn)) {
+            writeDecision(decisionPath, 'sign');
+            return;
+        }
+        if (detailResponse === Number($.NSAlertThirdButtonReturn)) {
+            writeDecision(decisionPath, 'cancel');
+            return;
+        }
+        app.activateIgnoringOtherApps(true);
+    }
+}

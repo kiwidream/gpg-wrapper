@@ -1,0 +1,445 @@
+#!/bin/bash
+
+# Git-specific OpenPGP preview wrapper for macOS.
+# Nothing except the real GPG process is allowed to write to stdout.
+
+set -u
+umask 077
+export LC_ALL=C
+
+PROGRAM_NAME="git-gpg-preview"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_FILE="$CONFIG_HOME/git-gpg-preview/config"
+REAL_GPG=""
+UI_HELPER=""
+LOCK_ROOT=""
+AUDIT_LOG=""
+REQUEST_DIR=""
+LOCK_FILE=""
+LOCK_HELD=0
+CHILD_PID=""
+
+error() {
+    printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+cleanup() {
+    if [[ "$LOCK_HELD" -eq 1 && -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+        local owner=""
+        owner=$(/bin/cat "$LOCK_FILE" 2>/dev/null || true)
+        if [[ "$owner" == "$$" ]]; then
+            /bin/rm -f "$LOCK_FILE"
+        fi
+        LOCK_HELD=0
+    fi
+    if [[ -n "$REQUEST_DIR" && -d "$REQUEST_DIR" ]]; then
+        /bin/rm -rf "$REQUEST_DIR"
+    fi
+}
+
+on_signal() {
+    local signal="$1"
+    if [[ -n "$CHILD_PID" ]]; then
+        /bin/kill -s "$signal" "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+        CHILD_PID=""
+    fi
+    cleanup
+    trap - "$signal"
+    /bin/kill -s "$signal" "$$"
+}
+
+trap cleanup EXIT
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal QUIT' QUIT
+trap 'on_signal TERM' TERM
+
+read_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "missing configuration: $CONFIG_FILE"
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            real_gpg=*) REAL_GPG=${line#real_gpg=} ;;
+            ui_helper=*) UI_HELPER=${line#ui_helper=} ;;
+            lock_root=*) LOCK_ROOT=${line#lock_root=} ;;
+            audit_log=*) AUDIT_LOG=${line#audit_log=} ;;
+            ''|'#'*) ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    if [[ "$REAL_GPG" != /* || ! -x "$REAL_GPG" ]]; then
+        error "real_gpg must name an executable absolute path"
+        return 1
+    fi
+    local self_dir self_path
+    self_dir=$(cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd) || return 1
+    self_path="$self_dir/$(basename -- "$0")"
+    if [[ "$REAL_GPG" == "$self_path" || "$REAL_GPG" -ef "$self_path" ]]; then
+        error "real_gpg resolves to this wrapper; refusing recursion"
+        return 1
+    fi
+    return 0
+}
+
+is_signing_request() {
+    local arg verify=0 signing=0 short after_options=0
+    for arg in "$@"; do
+        if [[ "$after_options" -eq 1 ]]; then
+            continue
+        fi
+        case "$arg" in
+            --verify) verify=1 ;;
+            --sign|--detach-sign|--clear-sign|--clearsign) signing=1 ;;
+            --) after_options=1 ;;
+            -[!-]*)
+                short=${arg#-}
+                if [[ "$short" == *s* || "$short" == *b* ]]; then
+                    signing=1
+                fi
+                ;;
+        esac
+    done
+    [[ "$verify" -eq 0 && "$signing" -eq 1 ]]
+}
+
+sanitize_stream() {
+    /usr/bin/tr '\000-\010\013\014\016-\037\177' '?'
+}
+
+sanitize_one_line() {
+    sanitize_stream | /usr/bin/tr '\n\r\t' '   '
+}
+
+valid_object_id() {
+    [[ "$1" =~ ^[0-9A-Fa-f]{40}$ || "$1" =~ ^[0-9A-Fa-f]{64}$ ]]
+}
+
+append_limited_sanitized() {
+    local source="$1" limit="$2"
+    /usr/bin/head -c "$limit" "$source" | sanitize_stream
+    local size
+    size=$(/usr/bin/wc -c < "$source" | /usr/bin/tr -d ' ')
+    if [[ "$size" -gt "$limit" ]]; then
+        printf '\n[truncated in summary; View Details shows the complete report]\n'
+    fi
+}
+
+acquire_dialog_lock() {
+    if [[ -z "$LOCK_ROOT" ]]; then
+        LOCK_ROOT="$HOME/Library/Caches/git-gpg-preview"
+    fi
+    if [[ "$LOCK_ROOT" != /* ]]; then
+        error "lock_root must be an absolute path"
+        return 1
+    fi
+    if [[ -L "$LOCK_ROOT" ]]; then
+        error "lock_root must not be a symbolic link"
+        return 1
+    fi
+    /bin/mkdir -p "$LOCK_ROOT" || return 1
+    /bin/chmod 700 "$LOCK_ROOT" || return 1
+    LOCK_FILE="$LOCK_ROOT/dialog.lock"
+    while ! /usr/bin/shlock -p "$$" -f "$LOCK_FILE" >/dev/null 2>&1; do
+        /bin/sleep 0.2
+    done
+    LOCK_HELD=1
+    return 0
+}
+
+release_dialog_lock() {
+    if [[ "$LOCK_HELD" -eq 1 ]]; then
+        local owner=""
+        owner=$(/bin/cat "$LOCK_FILE" 2>/dev/null || true)
+        if [[ "$owner" == "$$" ]]; then
+            /bin/rm -f "$LOCK_FILE"
+        fi
+        LOCK_HELD=0
+    fi
+}
+
+audit_decision() {
+    local decision="$1" repo="$2" kind="$3" hash="$4"
+    [[ -z "$AUDIT_LOG" ]] && return 0
+    if [[ "$AUDIT_LOG" != /* ]]; then
+        error "audit_log must be empty or an absolute path"
+        return 1
+    fi
+    local audit_dir caller safe_repo safe_caller timestamp
+    audit_dir=$(dirname -- "$AUDIT_LOG")
+    /bin/mkdir -p "$audit_dir" || return 1
+    /bin/chmod 700 "$audit_dir" || return 1
+    : >> "$AUDIT_LOG" || return 1
+    /bin/chmod 600 "$AUDIT_LOG" || return 1
+    caller=$(/bin/ps -p "$PPID" -o comm= 2>/dev/null || printf 'pid:%s' "$PPID")
+    safe_repo=$(printf '%s' "$repo" | sanitize_one_line)
+    safe_caller=$(printf '%s' "$caller" | sanitize_one_line)
+    timestamp=$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '%s\trepository=%s\ttype=%s\tpayload_sha256=%s\tcaller_pid=%s\tcaller=%s\tdecision=%s\n' \
+        "$timestamp" "$safe_repo" "$kind" "$hash" "$PPID" "$safe_caller" "$decision" >> "$AUDIT_LOG"
+}
+
+if ! read_config; then
+    exit 70
+fi
+
+if ! is_signing_request "$@"; then
+    exec "$REAL_GPG" "$@"
+fi
+
+if [[ -z "$UI_HELPER" || "$UI_HELPER" != /* || ! -f "$UI_HELPER" ]]; then
+    error "missing or invalid UI helper configuration"
+    exit 70
+fi
+
+TEMP_BASE=${TMPDIR:-/tmp}
+if [[ ! -d "$TEMP_BASE" ]]; then
+    error "temporary directory is unavailable"
+    exit 70
+fi
+REQUEST_DIR=$(/usr/bin/mktemp -d "${TEMP_BASE%/}/git-gpg-preview.XXXXXX") || {
+    error "could not create a secure request directory"
+    exit 70
+}
+/bin/chmod 700 "$REQUEST_DIR" || exit 70
+
+PAYLOAD="$REQUEST_DIR/payload"
+SUMMARY="$REQUEST_DIR/summary.txt"
+DETAILS="$REQUEST_DIR/details.txt"
+MESSAGE="$REQUEST_DIR/message.txt"
+DIFFSTAT="$REQUEST_DIR/diffstat.txt"
+FULL_DIFF="$REQUEST_DIR/full-diff.txt"
+DECISION="$REQUEST_DIR/decision"
+: > "$PAYLOAD"
+/bin/chmod 600 "$PAYLOAD"
+/bin/cat > "$PAYLOAD" || {
+    error "could not capture signing payload"
+    exit 70
+}
+
+BYTE_COUNT=$(/usr/bin/wc -c < "$PAYLOAD" | /usr/bin/tr -d ' ')
+PAYLOAD_SHA=$(/usr/bin/shasum -a 256 "$PAYLOAD" | /usr/bin/awk '{print $1}')
+
+REPOSITORY="(not in a Git worktree)"
+BRANCH="(not on a branch)"
+if repo_value=$(git --no-pager rev-parse --show-toplevel 2>/dev/null); then
+    REPOSITORY=$repo_value
+elif repo_value=$(git --no-pager rev-parse --absolute-git-dir 2>/dev/null); then
+    REPOSITORY=$repo_value
+fi
+if branch_value=$(git --no-pager symbolic-ref --quiet --short HEAD 2>/dev/null); then
+    BRANCH=$branch_value
+elif branch_value=$(git --no-pager rev-parse --short HEAD 2>/dev/null); then
+    BRANCH="detached at $branch_value"
+fi
+
+KEY_SELECTOR="(not supplied)"
+expect_key=0
+for arg in "$@"; do
+    if [[ "$expect_key" -eq 1 ]]; then
+        KEY_SELECTOR=$arg
+        expect_key=0
+        continue
+    fi
+    case "$arg" in
+        -u|--local-user|--default-key) expect_key=1 ;;
+        --local-user=*|--default-key=*) KEY_SELECTOR=${arg#*=} ;;
+        -[!-]*u) expect_key=1 ;;
+    esac
+done
+
+REQUEST_TYPE="unknown"
+TREE_HASH=""
+OBJECT_HASH=""
+PARENTS=()
+PARENT_COUNT=0
+FIRST_LINE=$(/usr/bin/sed -n '1p' "$PAYLOAD")
+
+if [[ "$FIRST_LINE" == tree\ * ]]; then
+    REQUEST_TYPE="commit"
+    TREE_HASH=$(/usr/bin/awk 'NF == 0 { exit } $1 == "tree" { print $2; exit }' "$PAYLOAD")
+    while IFS= read -r parent; do
+        if [[ -n "$parent" ]]; then
+            PARENTS+=("$parent")
+            PARENT_COUNT=$((PARENT_COUNT + 1))
+        fi
+    done < <(/usr/bin/awk 'NF == 0 { exit } $1 == "parent" { print $2 }' "$PAYLOAD")
+elif [[ "$FIRST_LINE" == object\ * ]] && /usr/bin/awk 'NF == 0 { exit } $1 == "tag" { found=1; exit } END { exit found ? 0 : 1 }' "$PAYLOAD"; then
+    REQUEST_TYPE="tag"
+    OBJECT_HASH=$(/usr/bin/awk 'NF == 0 { exit } $1 == "object" { print $2; exit }' "$PAYLOAD")
+elif [[ "$FIRST_LINE" == certificate\ version\ * ]]; then
+    REQUEST_TYPE="push certificate"
+fi
+
+/usr/bin/awk 'body { print; next } $0 == "" { body=1 }' "$PAYLOAD" > "$MESSAGE"
+: > "$DIFFSTAT"
+: > "$FULL_DIFF"
+
+if [[ "$REQUEST_TYPE" == "commit" ]]; then
+    if ! valid_object_id "$TREE_HASH" || ! git --no-pager cat-file -e "${TREE_HASH}^{tree}" 2>/dev/null; then
+        error "commit payload has an invalid or unavailable tree; refusing to sign"
+        exit 65
+    fi
+    if [[ "$PARENT_COUNT" -gt 0 ]]; then
+        for parent in "${PARENTS[@]}"; do
+            if ! valid_object_id "$parent" || ! git --no-pager cat-file -e "${parent}^{commit}" 2>/dev/null; then
+                error "commit payload has an invalid or unavailable parent; refusing to sign"
+                exit 65
+            fi
+        done
+    fi
+
+    BASES=()
+    if [[ "$PARENT_COUNT" -eq 0 ]]; then
+        EMPTY_TREE=$(git --no-pager hash-object -t tree --stdin </dev/null 2>/dev/null) || {
+            error "could not derive the empty tree for an initial commit"
+            exit 65
+        }
+        BASES+=("$EMPTY_TREE")
+    else
+        BASES=("${PARENTS[@]}")
+    fi
+
+    index=0
+    for base in "${BASES[@]}"; do
+        index=$((index + 1))
+        if [[ "$PARENT_COUNT" -eq 0 ]]; then
+            label="Initial commit (empty tree to proposed tree)"
+        elif [[ "$PARENT_COUNT" -eq 1 ]]; then
+            label="Changes from parent $base"
+        else
+            label="Changes from parent $index: $base"
+        fi
+        printf '%s\n' "$label" >> "$DIFFSTAT"
+        if ! git --no-pager diff --stat --summary --no-ext-diff --no-textconv --no-color "$base" "$TREE_HASH" -- >> "$DIFFSTAT" 2>"$REQUEST_DIR/diff-error"; then
+            error "could not safely derive the commit diffstat; refusing to sign"
+            exit 65
+        fi
+        printf '%s\n\n' "$label" >> "$FULL_DIFF"
+        if ! git --no-pager diff --no-ext-diff --no-textconv --no-color "$base" "$TREE_HASH" -- >> "$FULL_DIFF" 2>"$REQUEST_DIR/diff-error"; then
+            error "could not safely derive the full commit diff; refusing to sign"
+            exit 65
+        fi
+        printf '\n' >> "$DIFFSTAT"
+        printf '\n' >> "$FULL_DIFF"
+    done
+elif [[ "$REQUEST_TYPE" == "tag" ]]; then
+    if ! valid_object_id "$OBJECT_HASH" || ! git --no-pager cat-file -e "$OBJECT_HASH" 2>/dev/null; then
+        error "tag payload has an invalid or unavailable target object; refusing to sign"
+        exit 65
+    fi
+fi
+
+SAFE_REPOSITORY=$(printf '%s' "$REPOSITORY" | sanitize_one_line)
+SAFE_BRANCH=$(printf '%s' "$BRANCH" | sanitize_one_line)
+SAFE_KEY=$(printf '%s' "$KEY_SELECTOR" | sanitize_one_line)
+
+{
+    printf 'Repository/worktree: %s\n' "$SAFE_REPOSITORY"
+    printf 'Branch: %s\n' "$SAFE_BRANCH"
+    printf 'Request type: %s\n' "$REQUEST_TYPE"
+    printf 'Signing-key selector: %s\n' "$SAFE_KEY"
+    printf 'Exact payload: %s bytes\n' "$BYTE_COUNT"
+    printf 'Exact payload SHA-256: %s\n' "$PAYLOAD_SHA"
+    if [[ -n "$TREE_HASH" ]]; then
+        printf 'Tree: %s\n' "$TREE_HASH"
+        if [[ "$PARENT_COUNT" -eq 0 ]]; then
+            printf 'Parents: (initial commit; none)\n'
+        else
+            printf 'Parents/objects:\n'
+            for parent in "${PARENTS[@]}"; do printf '  %s\n' "$parent"; done
+        fi
+    elif [[ -n "$OBJECT_HASH" ]]; then
+        printf 'Target object: %s\n' "$OBJECT_HASH"
+    fi
+    printf '\nEXACT vs. DERIVED\n'
+    printf 'GPG will receive only the exact captured payload identified above.\n'
+    if [[ "$REQUEST_TYPE" == "commit" ]]; then
+        printf 'The tree hash commits to file content. The diff below is reconstructed from Git objects for review and is not literally part of GPG input.\n'
+    else
+        printf 'Any labels or summaries below are derived for review and are not added to GPG input.\n'
+    fi
+    printf '\nCOMMIT/TAG MESSAGE OR PAYLOAD BODY\n'
+    append_limited_sanitized "$MESSAGE" 2500
+    if [[ "$REQUEST_TYPE" == "commit" ]]; then
+        printf '\n\nDERIVED CHANGED-FILE SUMMARY / DIFFSTAT\n'
+        append_limited_sanitized "$DIFFSTAT" 6000
+    fi
+} > "$SUMMARY"
+
+{
+    printf 'GIT OPENPGP SIGNING REVIEW\n\n'
+    /bin/cat "$SUMMARY"
+    printf '\n\n============================================================\n'
+    printf 'EXACT SIGNED PAYLOAD — VERBATIM BYTES BETWEEN MARKERS\n'
+    printf 'Only these captured bytes are passed to GPG.\n'
+    printf '============================================================\n'
+    /bin/cat "$PAYLOAD"
+    printf '\n============================================================\n'
+    printf 'END EXACT SIGNED PAYLOAD\n'
+    printf '============================================================\n\n'
+    printf 'BYTE-PRESERVING HEX VIEW OF EXACT PAYLOAD\n\n'
+    /usr/bin/hexdump -C "$PAYLOAD"
+    if [[ "$REQUEST_TYPE" == "commit" ]]; then
+        printf '\n============================================================\n'
+        printf 'DERIVED FULL DIFF — REVIEW AID, NOT LITERAL GPG INPUT\n'
+        printf 'Generated with git --no-pager, --no-ext-diff, and --no-textconv.\n'
+        printf 'The signed tree hash commits to the resulting file content.\n'
+        printf '============================================================\n'
+        /bin/cat "$FULL_DIFF"
+    fi
+} > "$DETAILS"
+/bin/chmod 600 "$SUMMARY" "$DETAILS" "$MESSAGE" "$DIFFSTAT" "$FULL_DIFF"
+: > "$DECISION"
+/bin/chmod 600 "$DECISION"
+
+if ! acquire_dialog_lock; then
+    error "could not acquire the signing-preview dialog lock"
+    exit 70
+fi
+
+if ! /usr/bin/osascript -l JavaScript "$UI_HELPER" "$SUMMARY" "$DETAILS" "$DECISION" >/dev/null; then
+    release_dialog_lock
+    audit_decision "ui-error" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+    error "preview dialog failed; refusing to sign"
+    exit 70
+fi
+/bin/chmod 600 "$DECISION" 2>/dev/null || true
+DECISION_VALUE=$(/bin/cat "$DECISION" 2>/dev/null || true)
+release_dialog_lock
+
+case "$DECISION_VALUE" in
+    sign)
+        if ! audit_decision "sign" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA"; then
+            error "audit logging failed; refusing to sign"
+            exit 70
+        fi
+        ;;
+    cancel)
+        audit_decision "cancel" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+        error "signing cancelled by user"
+        exit 1
+        ;;
+    *)
+        audit_decision "invalid-ui-decision" "$REPOSITORY" "$REQUEST_TYPE" "$PAYLOAD_SHA" || true
+        error "preview returned no valid decision; refusing to sign"
+        exit 70
+        ;;
+esac
+
+"$REAL_GPG" "$@" < "$PAYLOAD" &
+CHILD_PID=$!
+wait "$CHILD_PID"
+GPG_STATUS=$?
+CHILD_PID=""
+if [[ "$GPG_STATUS" -ge 129 && "$GPG_STATUS" -le 192 ]]; then
+    GPG_SIGNAL=$((GPG_STATUS - 128))
+    if /bin/kill -l "$GPG_SIGNAL" >/dev/null 2>&1; then
+        cleanup
+        trap - "$GPG_SIGNAL"
+        /bin/kill -s "$GPG_SIGNAL" "$$"
+    fi
+fi
+exit "$GPG_STATUS"

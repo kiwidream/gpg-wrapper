@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -u
+umask 077
+
+CALL_DIR=${FAKE_GPG_CALL_DIR:?}
+mkdir -p "$CALL_DIR"
+id="$$.$RANDOM"
+payload="$CALL_DIR/$id.stdin"
+args="$CALL_DIR/$id.args"
+cat > "$payload"
+printf '%s\0' "$@" > "$args"
+printf '%s\n' "$id" >> "$CALL_DIR/calls"
+if [[ "${FAKE_GPG_STDOUT-}" != "" ]]; then
+    printf '%s' "$FAKE_GPG_STDOUT"
+fi
+if [[ "${FAKE_GPG_STDERR-}" != "" ]]; then
+    printf '%s' "$FAKE_GPG_STDERR" >&2
+fi
+if [[ "${FAKE_GPG_SIGNAL-}" != "" ]]; then
+    kill -s "$FAKE_GPG_SIGNAL" "$$"
+fi
+exit "${FAKE_GPG_EXIT:-0}"
