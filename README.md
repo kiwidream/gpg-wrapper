@@ -1,6 +1,8 @@
 # git-gpg-preview
 
-`git-gpg-preview` is a fail-closed, Git-specific OpenPGP wrapper for macOS. Git invokes it through `gpg.openpgp.program`. Before a signing request reaches GnuPG, the wrapper captures the exact stdin bytes once, explains what Git is asking GPG to sign, and requires an explicit **Sign** decision in a foreground dialog.
+`git-gpg-preview` is a fail-closed, Git-specific OpenPGP wrapper for macOS. Git invokes it through `gpg.openpgp.program`. For a signing request, the wrapper captures the exact stdin bytes once, shows a concise foreground preview of what Git is asking GPG to sign, and engages real GnuPG concurrently so your hardware key's confirmation prompt is active while the preview is on screen.
+
+Because GnuPG is engaged during the preview, your key blocks on its normal confirmation (a touch, plus the PIN only when gpg-agent has not cached it). Touching the key completes the signature and dismisses the preview; **Cancel** kills GnuPG before it produces a signature, so Git aborts. The physical hardware confirmation — not a software button — is the authorization gate.
 
 Verification and other non-signing GPG operations pass directly to the configured absolute GPG executable without a dialog.
 
@@ -43,19 +45,21 @@ The audit file and its directory are restricted to the current user. Each line c
 
 ## Review behavior
 
-For signing operations, stdin is copied exactly once into a unique mode-0600 file within a mode-0700 temporary request directory. Each request retains its own payload. Dialogs from simultaneous Git processes are serialized using macOS `shlock`; dead-process locks are recovered atomically.
+For signing operations, stdin is copied exactly once into a unique mode-0600 file within a mode-0700 temporary request directory. Each request retains its own payload. Dialogs from simultaneous Git processes are serialized using macOS `shlock`; dead-process locks are recovered atomically. Because each request holds the lock across its preview and signature, one hardware confirmation completes before the next request's preview appears.
 
-The main dialog shows:
+The main dialog is deliberately small and concise, showing:
 
-- repository/worktree and branch;
-- commit, annotated tag, push certificate, or unknown request type;
-- commit/tag message or payload body;
-- tree and parent/target object hashes;
+- request type: commit, annotated tag, push certificate, or unknown;
+- branch;
 - GPG signing-key selector, when present;
 - exact byte count and SHA-256;
-- a derived per-parent changed-file summary for commits.
+- the commit/tag message or payload body.
 
-**View Details** opens a selectable, scrollable report containing the verbatim captured payload, a byte-preserving hex view, and the complete safely generated diff for commits. **Sign** sends the captured bytes to the absolute real GPG with the original arguments. **Cancel** returns nonzero without starting GPG, so Git aborts.
+**View Details** opens a selectable, scrollable report containing everything else: the full repository/worktree path, the tree and parent/target object hashes, the per-parent changed-file summary, the verbatim captured payload, a byte-preserving hex view, and the complete safely generated diff for commits.
+
+The preview appears and reports readiness before GPG is engaged, so when a PIN is required the pinentry prompt launches last and stays frontmost and focused rather than opening behind the preview. The preview does not steal focus back, so you can type the PIN and then touch the key.
+
+There is no **Sign** button: the signature is produced by the hardware confirmation that is already pending while the preview is shown. Touching the key completes signing with the captured bytes and original arguments and dismisses the window. **Cancel** kills GPG before it produces a signature and returns nonzero, so Git aborts.
 
 The dialog deliberately labels two different things:
 
@@ -66,16 +70,17 @@ Diffs are generated with `git --no-pager`, `--no-ext-diff`, and `--no-textconv`;
 
 ## Fail-closed cases
 
-A signing request is rejected before GPG runs when the real-GPG path or UI helper is missing, the UI cannot run, no valid decision is returned, a recognized commit/tag payload cannot be safely parsed against available Git objects, a secure temporary area cannot be created, or a configured audit log cannot be written for an approval. Unknown signing formats still receive a clearly labeled exact-payload review.
+A signing request is rejected before GPG runs when the real-GPG path or UI helper is missing, a recognized commit/tag payload cannot be safely parsed against available Git objects, or a secure temporary area cannot be created. Once the preview and GPG are engaged, a **Cancel** decision, a preview process that exits without approval, or any outcome other than a completed signature kills GPG before it produces a signature. Unknown signing formats still receive a clearly labeled exact-payload review.
 
-Non-signing operations require a valid real-GPG configuration too; when configured correctly, they use `exec` for transparent argument, descriptor, signal, stdout/stderr, and exit behavior. For approved signing, stdout and stderr remain connected directly to GPG, and the wrapper propagates GPG's exact exit code and forwards termination signals. The wrapper never writes UI or diagnostic text to stdout because Git expects the detached signature there.
+Non-signing operations require a valid real-GPG configuration too; when configured correctly, they use `exec` for transparent argument, descriptor, signal, stdout/stderr, and exit behavior. For signing, stdout and stderr remain connected directly to GPG, and the wrapper propagates GPG's exact exit code and forwards termination signals. The wrapper never writes UI or diagnostic text to stdout because Git expects the detached signature there.
 
 ## Threat model and limitations
 
-This tool protects against accidentally approving an unexpected Git OpenPGP signing payload and makes concurrent agent-driven requests attributable at review time. It prevents cancellation and preview failures from silently falling through to GPG. It does not replace GnuPG signature security, hardware-key confirmation, repository access controls, or careful review.
+This tool protects against accidentally producing an unexpected Git OpenPGP signature: the payload is reviewed while your hardware key waits, and the deliberate physical confirmation is what completes the signature. It makes concurrent agent-driven requests attributable at review time and serializes them behind a single hardware confirmation. It does not replace GnuPG signature security, hardware-key confirmation, repository access controls, or careful review.
 
 Important limitations:
 
+- The preview is shown while GnuPG is already engaged, so the hardware confirmation is the authorization gate. This is a deliberate trade for the touch-to-sign workflow: unlike a design that contacts GPG only after a software approval, GnuPG and gpg-agent are invoked for every signing request. A key whose policy requires no touch (for example, a cached PIN and touch disabled) can therefore complete signing before the preview is meaningfully reviewed; keep the hardware touch requirement enabled so signing always blocks on a deliberate action.
 - A process already running as your macOS account can modify user-owned wrapper/configuration files, tamper with Git objects between review and later use, simulate UI, or invoke GPG directly.
 - The derived diff reflects objects available when the preview is built. The signed tree hash—not the rendered diff—is authoritative.
 - Binary and very large changes can make a full textual report unwieldy; the exact payload's hex view remains byte-preserving.

@@ -18,19 +18,39 @@ function write(path, text) {
     handle.closeFile;
 }
 
+function readText(path) {
+    const data = $.NSData.dataWithContentsOfFile(path);
+    if (!data) return '';
+    return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding)) || '';
+}
+
 function run(argv) {
     const env = $.NSProcessInfo.processInfo.environment;
     const log = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_LOG') || '');
     const captureDir = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_CAPTURE_DIR') || '');
     const decision = ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DECISION') || 'sign');
     const delay = Number(ObjC.unwrap(env.objectForKey('FAKE_DIALOG_DELAY') || '0'));
+    const touch = ObjC.unwrap(env.objectForKey('FAKE_TOUCH_FILE') || '');
     if (log) append(log, 'start ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
+    if (argv.length > 3 && argv[3]) {
+        $.NSData.data.writeToFileAtomically(argv[3], true);
+    }
     if (captureDir) {
         const pid = String($.NSProcessInfo.processInfo.processIdentifier);
         $.NSData.dataWithContentsOfFile(argv[0]).writeToFileAtomically(captureDir + '/' + pid + '.summary', true);
         $.NSData.dataWithContentsOfFile(argv[1]).writeToFileAtomically(captureDir + '/' + pid + '.details', true);
     }
     if (delay > 0) $.NSThread.sleepForTimeInterval(delay);
+    // A real preview has no Sign button: the hardware touch completes signing.
+    // For "sign" the fake reports that touch so the fake GPG can proceed; for
+    // "cancel" it reports no touch, and the wrapper kills GPG before signing.
+    // The touch file is keyed by the payload SHA-256 shown in the summary so
+    // that concurrent, distinct requests stay isolated from one another.
+    if (decision === 'sign' && touch) {
+        const match = readText(argv[0]).match(/SHA-256:\s*([0-9a-f]+)/);
+        const key = match ? match[1] : 'default';
+        $.NSData.data.writeToFileAtomically(touch + '.' + key, true);
+    }
     write(argv[2], decision);
     if (log) append(log, 'end ' + $.NSProcessInfo.processInfo.processIdentifier + '\n');
 }

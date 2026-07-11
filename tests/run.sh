@@ -17,6 +17,9 @@ export FAKE_DIALOG_CAPTURE_DIR="$TMP/captures"
 export FAKE_DIALOG_DECISION=sign
 export FAKE_DIALOG_DELAY=0
 export FAKE_DIALOG_LOG="$TMP/dialog.log"
+# Shared "hardware touch" signal: the fake dialog creates it for a sign
+# decision; the fake GPG blocks on it so signing is concurrent with review.
+export FAKE_TOUCH_FILE="$TMP/touch"
 
 cat > "$XDG_CONFIG_HOME/git-gpg-preview/config" <<EOF
 real_gpg=$ROOT/tests/helpers/fake-gpg
@@ -42,22 +45,28 @@ latest_call() {
 latest_capture() {
     ls -t "$TMP/captures"/*.summary | head -n 1
 }
+details_of() {
+    printf '%s\n' "${1%.summary}.details"
+}
 assert_forwarded() {
     local expected="$1" id
     id=$(latest_call)
     cmp -s "$expected" "$FAKE_GPG_CALL_DIR/$id.stdin" || fail "stdin changed before real GPG"
 }
 run_preview() {
-    local label="$1" payload="$2" expected_type="$3" expected_stdout output summary id
+    local label="$1" payload="$2" expected_type="$3" expected_stdout output summary details id
     expected_stdout="signature:$label"
     export FAKE_GPG_STDOUT="$expected_stdout"
+    rm -f "$FAKE_TOUCH_FILE".*
     output=$("$ROOT/git-gpg-preview" --status-fd=2 -bsau 'TEST KEY ! $(touch bad)' < "$payload")
     [[ "$output" == "$expected_stdout" ]] || fail "$label contaminated stdout"
     assert_forwarded "$payload"
     summary=$(latest_capture)
+    details=$(details_of "$summary")
     grep -F "Request type: $expected_type" "$summary" >/dev/null || fail "$label classified incorrectly"
-    grep -F 'Exact payload SHA-256:' "$summary" >/dev/null || fail "$label omitted payload hash"
-    grep -F 'Signing-key selector: TEST KEY ! $(touch bad)' "$summary" >/dev/null || fail "$label lost key selector"
+    grep -F 'SHA-256:' "$summary" >/dev/null || fail "$label omitted payload hash"
+    grep -F 'Signing key: TEST KEY ! $(touch bad)' "$summary" >/dev/null || fail "$label lost key selector"
+    grep -F 'Exact payload SHA-256:' "$details" >/dev/null || fail "$label details omitted payload hash"
     [[ ! -e "$FIXTURE/bad" ]] || fail "$label executed hostile-looking key content"
     id=$(latest_call)
     printf '%s\0' --status-fd=2 -bsau 'TEST KEY ! $(touch bad)' > "$TMP/expected.args"
@@ -105,8 +114,9 @@ cd "$FIXTURE"
 
 run_preview 'initial commit' "$TMP/initial.payload" commit
 summary=$(latest_capture)
-grep -F 'Parents: (initial commit; none)' "$summary" >/dev/null || fail 'initial commit parent display'
-grep -F 'Initial commit (empty tree to proposed tree)' "$summary" >/dev/null || fail 'initial commit diffstat'
+details=$(details_of "$summary")
+grep -F 'Parents: (initial commit; none)' "$details" >/dev/null || fail 'initial commit parent display'
+grep -F 'Initial commit (empty tree to proposed tree)' "$details" >/dev/null || fail 'initial commit diffstat'
 pass 'initial signed commit payload and root diffstat'
 
 EVIL="$TMP/evil-diff"
@@ -121,8 +131,8 @@ run_preview 'signed commit' "$TMP/commit.payload" commit
 [[ ! -e "$TMP/external-diff-ran" ]] || fail 'external diff executed'
 summary=$(latest_capture)
 grep -F 'Unicode Ω and spaces' "$summary" >/dev/null || fail 'Unicode message missing'
-grep -F 'DERIVED CHANGED-FILE SUMMARY / DIFFSTAT' "$summary" >/dev/null || fail 'diffstat missing'
-details=${summary%.summary}.details
+details=$(details_of "$summary")
+grep -F 'DERIVED CHANGED-FILE SUMMARY / DIFFSTAT' "$details" >/dev/null || fail 'diffstat missing'
 grep -F 'EXACT SIGNED PAYLOAD — VERBATIM BYTES BETWEEN MARKERS' "$details" >/dev/null || fail 'exact payload detail missing'
 grep -F 'DERIVED FULL DIFF — REVIEW AID, NOT LITERAL GPG INPUT' "$details" >/dev/null || fail 'derived diff warning missing'
 [[ ! -e "$FIXTURE/bad" ]] || fail 'hostile message or filename executed'
@@ -130,14 +140,16 @@ pass 'signed commit, hostile content, safe derived diff, and exact payload detai
 
 run_preview 'merge commit' "$TMP/merge.payload" commit
 summary=$(latest_capture)
-[[ $(grep -c '^  [0-9a-f]\{40\}$' "$summary") -eq 2 ]] || fail 'merge parents not shown'
-grep -F 'Changes from parent 2:' "$summary" >/dev/null || fail 'second merge-parent diffstat missing'
+details=$(details_of "$summary")
+[[ $(grep -c '^  [0-9a-f]\{40\}$' "$details") -eq 2 ]] || fail 'merge parents not shown'
+grep -F 'Changes from parent 2:' "$details" >/dev/null || fail 'second merge-parent diffstat missing'
 pass 'merge commit with multiple parents'
 
 run_preview 'annotated tag' "$TMP/tag.payload" tag
 summary=$(latest_capture)
+details=$(details_of "$summary")
 grep -F 'Annotated tag Ω' "$summary" >/dev/null || fail 'tag message missing'
-grep -F 'Target object:' "$summary" >/dev/null || fail 'tag target missing'
+grep -F 'Target object:' "$details" >/dev/null || fail 'tag target missing'
 pass 'annotated tag payload'
 
 {
@@ -159,6 +171,7 @@ pass 'push certificate payload'
 
 before=$(wc -l < "$FAKE_GPG_CALL_DIR/calls")
 export FAKE_DIALOG_DECISION=cancel
+rm -f "$FAKE_TOUCH_FILE".*
 set +e
 cancel_output=$("$ROOT/git-gpg-preview" -bsau TEST < "$TMP/commit.payload" 2>"$TMP/cancel.stderr")
 cancel_status=$?
@@ -179,6 +192,7 @@ pass 'verification invocation transparently passes through'
 
 export FAKE_GPG_STDOUT='gpg-failure-output'
 export FAKE_GPG_EXIT=42
+rm -f "$FAKE_TOUCH_FILE".*
 set +e
 "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/commit.payload" > "$TMP/failure.stdout" 2> "$TMP/failure.stderr"
 failure_status=$?
@@ -191,6 +205,7 @@ pass 'GPG failure and exact exit code propagation'
 
 export FAKE_GPG_STDOUT=''
 export FAKE_GPG_SIGNAL=TERM
+rm -f "$FAKE_TOUCH_FILE".*
 set +e
 "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/commit.payload" > "$TMP/signal.stdout" 2> "$TMP/signal.stderr"
 signal_status=$?
@@ -203,6 +218,7 @@ pass 'GPG termination-signal propagation'
 : > "$FAKE_DIALOG_LOG"
 export FAKE_GPG_STDOUT='parallel-signature'
 export FAKE_DIALOG_DELAY=0.35
+rm -f "$FAKE_TOUCH_FILE".*
 "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/commit.payload" > "$TMP/parallel.1" 2> "$TMP/parallel.1.err" &
 p1=$!
 "$ROOT/git-gpg-preview" -bsau TEST < "$TMP/merge.payload" > "$TMP/parallel.2" 2> "$TMP/parallel.2.err" &
@@ -221,6 +237,7 @@ pass 'concurrent requests queue dialogs and retain separate payloads'
 
 printf '999999\n' > "$TMP/lock/dialog.lock"
 export FAKE_GPG_STDOUT='stale-lock-recovered'
+rm -f "$FAKE_TOUCH_FILE".*
 stale_output=$("$ROOT/git-gpg-preview" -bsau TEST < "$TMP/commit.payload")
 [[ "$stale_output" == 'stale-lock-recovered' ]] || fail 'stale lock recovery failed'
 pass 'stale dialog lock recovery'

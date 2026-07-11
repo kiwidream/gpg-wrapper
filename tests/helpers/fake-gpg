@@ -9,6 +9,44 @@ id="$$.$RANDOM"
 payload="$CALL_DIR/$id.stdin"
 args="$CALL_DIR/$id.args"
 cat > "$payload"
+
+# Simulate a hardware confirmation for signing invocations: block until the
+# fake dialog reports a touch. Verification and other pass-through operations
+# never wait. If the wrapper cancels, it kills this process during the wait,
+# so no call is recorded (matching a real "cancelled before signing").
+signing=0
+verify=0
+after_options=0
+for arg in "$@"; do
+    if [[ "$after_options" -eq 1 ]]; then
+        continue
+    fi
+    case "$arg" in
+        --verify) verify=1 ;;
+        --sign|--detach-sign|--clear-sign|--clearsign) signing=1 ;;
+        --) after_options=1 ;;
+        -[!-]*)
+            short=${arg#-}
+            if [[ "$short" == *s* || "$short" == *b* ]]; then
+                signing=1
+            fi
+            ;;
+    esac
+done
+if [[ "$signing" -eq 1 && "$verify" -eq 0 && -n "${FAKE_TOUCH_FILE-}" ]]; then
+    sha=$(shasum -a 256 "$payload" | awk '{print $1}')
+    touch_file="$FAKE_TOUCH_FILE.$sha"
+    waited=0
+    while [[ ! -e "$touch_file" ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+        if [[ "$waited" -ge 200 ]]; then
+            printf 'fake-gpg: timed out waiting for touch\n' >&2
+            exit 2
+        fi
+    done
+fi
+
 printf '%s\0' "$@" > "$args"
 printf '%s\n' "$id" >> "$CALL_DIR/calls"
 if [[ "${FAKE_GPG_STDOUT-}" != "" ]]; then

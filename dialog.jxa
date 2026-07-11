@@ -31,6 +31,11 @@ function writeDecision(path, decision) {
     handle.closeFile;
 }
 
+function markReady(path) {
+    if (!path) return;
+    $.NSData.data.writeToFileAtomically(path, true);
+}
+
 function scrollableText(text, width, height) {
     const frame = $.NSMakeRect(0, 0, width, height);
     const scroll = $.NSScrollView.alloc.initWithFrame(frame);
@@ -58,31 +63,37 @@ function scrollableText(text, width, height) {
 }
 
 function run(argv) {
-    if (argv.length !== 3) {
+    if (argv.length < 3) {
         throw new Error('Expected summary, details, and decision paths.');
     }
     const summary = readText(argv[0]);
     const details = readText(argv[1]);
     const decisionPath = argv[2];
+    const readyPath = argv.length > 3 ? argv[3] : '';
 
     const app = $.NSApplication.sharedApplication;
     app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    // Activate once, up front, before GPG (and therefore pinentry) is engaged.
+    // We deliberately do not re-activate afterward: the PIN prompt launches
+    // last and must stay frontmost and focused, not behind this preview.
     app.activateIgnoringOtherApps(true);
 
+    let first = true;
     while (true) {
         const alert = $.NSAlert.alloc.init;
-        alert.alertStyle = $.NSAlertStyleWarning;
-        alert.messageText = 'Git OpenPGP Signing Preview';
-        alert.informativeText = 'Review the request below. GPG receives only the exact payload identified by byte count and SHA-256; commit diffs are derived review aids.';
-        alert.accessoryView = scrollableText(summary, 780, 430);
-        alert.addButtonWithTitle('Sign');
-        alert.addButtonWithTitle('Cancel');
+        alert.alertStyle = $.NSAlertStyleInformational;
+        alert.messageText = 'Confirm signature on your key';
+        alert.informativeText = 'Touch your key to sign; this closes when done. View Details for the full payload, or Cancel to abort.';
+        alert.accessoryView = scrollableText(summary, 460, 150);
         alert.addButtonWithTitle('View Details');
-        const response = Number(alert.runModal);
-        if (response === Number($.NSAlertFirstButtonReturn)) {
-            writeDecision(decisionPath, 'sign');
-            return;
+        alert.addButtonWithTitle('Cancel');
+        // Report readiness only once, as the first preview is about to show,
+        // so the wrapper engages GPG after this window is already up.
+        if (first) {
+            markReady(readyPath);
+            first = false;
         }
+        const response = Number(alert.runModal);
         if (response === Number($.NSAlertSecondButtonReturn)) {
             writeDecision(decisionPath, 'cancel');
             return;
@@ -91,21 +102,14 @@ function run(argv) {
         const detailAlert = $.NSAlert.alloc.init;
         detailAlert.alertStyle = $.NSAlertStyleInformational;
         detailAlert.messageText = 'Exact Payload and Derived Review Report';
-        detailAlert.informativeText = 'The exact GPG input is explicitly marked. The full diff is derived from Git objects and is not literal signed input.';
+        detailAlert.informativeText = 'The exact GPG input is explicitly marked between the payload markers. The full diff is derived from Git objects and is not literal signed input. Touch your security key to sign, or return and Cancel to abort.';
         detailAlert.accessoryView = scrollableText(details, 920, 600);
         detailAlert.addButtonWithTitle('Back');
-        detailAlert.addButtonWithTitle('Sign');
         detailAlert.addButtonWithTitle('Cancel');
-        app.activateIgnoringOtherApps(true);
         const detailResponse = Number(detailAlert.runModal);
         if (detailResponse === Number($.NSAlertSecondButtonReturn)) {
-            writeDecision(decisionPath, 'sign');
-            return;
-        }
-        if (detailResponse === Number($.NSAlertThirdButtonReturn)) {
             writeDecision(decisionPath, 'cancel');
             return;
         }
-        app.activateIgnoringOtherApps(true);
     }
 }
